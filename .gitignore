@@ -1,0 +1,22 @@
+# Ignorar archivos con credenciales
+config.json
+
+# Perfil de Edge con sesión guardada
+edge_profile/
+edge_profile2/
+chrome_profile/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Logs
+*.log
+task_log.txt
+
+# Archivos temporales de Claude
+tmpclaude-*
