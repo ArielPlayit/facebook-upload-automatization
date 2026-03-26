@@ -1,5 +1,6 @@
 # Ignorar archivos con credenciales
 config.json
+config.example.json
 
 # Perfil de Edge con sesión guardada
 edge_profile/
