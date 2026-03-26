@@ -21,3 +21,6 @@ task_log.txt
 
 # Archivos temporales de Claude
 tmpclaude-*
+
+#Debug Folder
+debug_failures/
