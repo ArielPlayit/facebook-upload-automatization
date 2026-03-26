@@ -20,9 +20,12 @@ import sys
 import time
 import random
 import string
-import subprocess
 import traceback
 import threading
+import re
+import subprocess
+from datetime import datetime
+from pathlib import Path
 
 # Forzar UTF-8 en stdout/stderr para evitar errores en consola de Windows
 if hasattr(sys.stdout, 'reconfigure'):
@@ -36,16 +39,12 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.edge.service import Service as EdgeService
-from webdriver_manager.microsoft import EdgeChromiumDriverManager
 from selenium.webdriver.edge.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException, WebDriverException, NoSuchWindowException, InvalidSessionIdException
 from selenium.webdriver import ActionChains
 import pyperclip
-import shutil
-import tempfile
-import atexit
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -238,6 +237,215 @@ def wait_for_page_load(driver, timeout: int = 30):
         pass  # Con estrategia eager la página puede tardar; continuar de todos modos
 
 
+def navigate_with_retries(driver: webdriver.Edge, url: str, retries: int = 2) -> bool:
+    """Navega a una URL con reintentos ante fallos intermitentes del renderer de Edge."""
+    transient_markers = [
+        "timed out receiving message from renderer",
+        "target frame detached",
+        "not connected to devtools",
+        "disconnected",
+        "invalid session id",
+    ]
+
+    for attempt in range(1, retries + 1):
+        try:
+            driver.get(url)
+            wait_for_page_load(driver)
+            return True
+        except (TimeoutException, WebDriverException) as e:
+            msg = str(e).lower()
+            is_transient = any(marker in msg for marker in transient_markers)
+            print(f"   ⚠️ Error navegando ({attempt}/{retries}): {e}")
+            if attempt >= retries or not is_transient:
+                return False
+            HumanBehavior.random_delay(2, 4)
+
+    return False
+
+
+def is_session_lost_error(error: Exception) -> bool:
+    """Detecta errores de Selenium que indican sesión/ventana cerrada."""
+    if isinstance(error, (NoSuchWindowException, InvalidSessionIdException)):
+        return True
+    msg = str(error).lower()
+    markers = [
+        "no such window",
+        "target window already closed",
+        "invalid session id",
+        "not connected to devtools",
+        "session deleted",
+        "target frame detached",
+    ]
+    return any(marker in msg for marker in markers)
+
+
+def is_driver_alive(driver: webdriver.Edge) -> bool:
+    """Valida de forma barata que el driver y la ventana principal siguen activos."""
+    try:
+        handles = driver.window_handles
+        return bool(handles)
+    except Exception:
+        return False
+
+
+def cleanup_edge_processes() -> None:
+    """Cierra procesos de Edge/EdgeDriver que puedan bloquear el perfil persistente."""
+    commands = [
+        ["taskkill", "/IM", "msedgedriver.exe", "/F"],
+        ["taskkill", "/IM", "msedge.exe", "/F"],
+    ]
+    for cmd in commands:
+        try:
+            subprocess.run(cmd, check=False, capture_output=True, text=True)
+        except Exception:
+            pass
+
+
+def _sanitize_filename(text: str, fallback: str = "unknown") -> str:
+    """Convierte un texto en nombre de archivo seguro para Windows."""
+    if not text:
+        return fallback
+    safe = re.sub(r"[^a-zA-Z0-9._-]", "_", text)
+    safe = re.sub(r"_+", "_", safe).strip("._-")
+    return safe[:80] or fallback
+
+
+def capture_failure_artifacts(driver: webdriver.Edge, group_id: str, reason: str, account_name: str) -> None:
+    """Guarda screenshot, HTML y metadatos para facilitar debug de fallos."""
+    try:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        root = Path("debug_failures") / datetime.now().strftime("%Y%m%d")
+        root.mkdir(parents=True, exist_ok=True)
+
+        safe_group = _sanitize_filename(group_id, "group")
+        safe_reason = _sanitize_filename(reason, "failure")
+        base_name = f"{ts}_{safe_group}_{safe_reason}"
+
+        screenshot_path = root / f"{base_name}.png"
+        html_path = root / f"{base_name}.html"
+        meta_path = root / f"{base_name}.txt"
+
+        screenshot_ok = False
+        try:
+            screenshot_ok = driver.save_screenshot(str(screenshot_path))
+        except Exception:
+            screenshot_ok = False
+
+        page_source_ok = False
+        try:
+            html_path.write_text(driver.page_source or "", encoding="utf-8", errors="replace")
+            page_source_ok = True
+        except Exception:
+            page_source_ok = False
+
+        current_url = ""
+        title = ""
+        ready_state = ""
+        session_id = ""
+        try:
+            current_url = driver.current_url
+        except Exception:
+            current_url = "<unavailable>"
+        try:
+            title = driver.title
+        except Exception:
+            title = "<unavailable>"
+        try:
+            ready_state = driver.execute_script("return document.readyState")
+        except Exception:
+            ready_state = "<unavailable>"
+        try:
+            session_id = driver.session_id or "<none>"
+        except Exception:
+            session_id = "<unavailable>"
+
+        meta_lines = [
+            f"timestamp={datetime.now().isoformat()}",
+            f"account={account_name}",
+            f"group_id={group_id}",
+            f"reason={reason}",
+            f"current_url={current_url}",
+            f"title={title}",
+            f"document_ready_state={ready_state}",
+            f"session_id={session_id}",
+            f"screenshot_saved={screenshot_ok}",
+            f"html_saved={page_source_ok}",
+        ]
+        meta_path.write_text("\n".join(meta_lines) + "\n", encoding="utf-8", errors="replace")
+
+        print(f"   🧪 Debug guardado: {meta_path}")
+    except Exception as debug_err:
+        print(f"   ⚠️ No se pudo guardar evidencia de debug: {debug_err}")
+
+
+def detect_group_posting_block_reason(driver: webdriver.Edge) -> tuple[str, str]:
+    """Detecta causas frecuentes de bloqueo para publicar dentro de un grupo."""
+    try:
+        page_text = (driver.page_source or "").lower()
+    except Exception:
+        page_text = ""
+
+    patterns = [
+        (
+            "no_permission",
+            "No tienes permiso para publicar en este grupo.",
+            [
+                "no tienes permiso para publicar",
+                "no puedes publicar",
+                "no puedes crear publicaciones",
+                "you can't post",
+                "you cannot post",
+                "only admins can post",
+                "only admins and moderators can post",
+                "solo los administradores pueden publicar",
+                "solo admins",
+                "posting is turned off",
+                "publicaciones desactivadas",
+            ],
+        ),
+        (
+            "pending_approval",
+            "Tus publicaciones en este grupo requieren aprobacion.",
+            [
+                "pendiente de aprobaci",
+                "publicaci\u00f3n pendiente",
+                "post is pending admin approval",
+                "pending admin approval",
+                "must be approved by an admin",
+                "requiere aprobaci",
+            ],
+        ),
+        (
+            "join_required",
+            "Debes unirte al grupo antes de publicar.",
+            [
+                "unirte al grupo",
+                "debes unirte",
+                "join group",
+                "request to join",
+                "requested to join",
+                "hazte miembro",
+            ],
+        ),
+        (
+            "session_inactive",
+            "La sesion parece inactiva o redirigida a login.",
+            [
+                "inicia sesi",
+                "iniciar sesi",
+                "log in to facebook",
+                "create a new account",
+            ],
+        ),
+    ]
+
+    for code, message, needles in patterns:
+        if any(needle in page_text for needle in needles):
+            return code, message
+
+    return "unknown", "No se pudo determinar la causa exacta del bloqueo."
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURACIÓN DE DRIVER CON ANTI-DETECCIÓN
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -323,28 +531,12 @@ def create_driver(headless: bool = False, profile_path: str = None) -> webdriver
     if headless:
         options.add_argument("--headless=new")
     
-    # Usar perfil existente para mantener sesión iniciada.
-    # Para evitar bloqueos si el perfil ya está en uso, hacemos una copia temporal
-    # y usamos esa copia como `user-data-dir`. Registramos la copia para borrarla
-    # al terminar.
-    temp_profile_to_cleanup = None
+    # Usar SIEMPRE el perfil real para conservar cookies y sesión entre ejecuciones.
+    # Nota: si el perfil está abierto en otra instancia de Edge, puede fallar el arranque.
     if profile_path:
-        try:
-            # Crear carpeta temporal y copiar el perfil (si es posible)
-            temp_profile = tempfile.mkdtemp(prefix="edge_profile_")
-            try:
-                shutil.copytree(profile_path, temp_profile, dirs_exist_ok=True)
-                temp_profile_to_cleanup = temp_profile
-                options.add_argument(f"--user-data-dir={temp_profile}")
-                print(f"   ⚠️ Perfil en uso: usando copia temporal {temp_profile}")
-            except Exception:
-                # Si la copia falla, usar un perfil temporal vacío (evita bloqueo)
-                temp_profile_to_cleanup = temp_profile
-                options.add_argument(f"--user-data-dir={temp_profile}")
-                print(f"   ⚠️ No se pudo copiar el perfil; usando perfil temporal vacío {temp_profile}")
-        except Exception as e:
-            options.add_argument(f"--user-data-dir={profile_path}")
-            print(f"   ⚠️ Error preparando perfil: {e}; usando {profile_path}")
+        options.add_argument(f"--user-data-dir={profile_path}")
+        options.add_argument("--profile-directory=Default")
+        print(f"   ✓ Usando perfil persistente: {profile_path}")
     
     # ═══ OPCIONES ANTI-DETECCIÓN ═══
     options.add_argument("--disable-notifications")
@@ -387,24 +579,14 @@ def create_driver(headless: bool = False, profile_path: str = None) -> webdriver
     }
     options.add_experimental_option("prefs", prefs)
     
-    # Usar EdgeDriver compatible con la versión instalada de Edge
+    # Selenium Manager suele arrancar más rápido/estable en ejecuciones repetidas.
     try:
-        driver_path = EdgeChromiumDriverManager().install()
-        service = EdgeService(executable_path=driver_path)
+        service = EdgeService()
         driver = webdriver.Edge(service=service, options=options)
-        print(f"   ✓ Usando EdgeDriver via webdriver_manager")
+        print(f"   ✓ Usando EdgeDriver via selenium-manager")
     except Exception:
-        # Fallback: usar selenium-manager integrado en Selenium
-        try:
-            _sm = os.path.join(os.path.dirname(webdriver.__file__), "common", "windows", "selenium-manager.exe")
-            _result = json.loads(subprocess.check_output([_sm, "--browser", "edge", "--output", "json"]))
-            driver_path = _result["result"]["driver_path"]
-            service = EdgeService(executable_path=driver_path)
-            driver = webdriver.Edge(service=service, options=options)
-            print(f"   ✓ Usando EdgeDriver via selenium-manager")
-        except Exception:
-            driver = webdriver.Edge(options=options)
-            print(f"   ✓ Usando EdgeDriver del sistema")
+        driver = webdriver.Edge(options=options)
+        print(f"   ✓ Usando EdgeDriver del sistema")
     
     # ═══ SCRIPTS CDP ANTI-DETECCIÓN ═══
     try:
@@ -431,24 +613,15 @@ def create_driver(headless: bool = False, profile_path: str = None) -> webdriver
 
     print("   ✓ Navegador inicializado correctamente")
 
-    # Registrar limpieza del perfil temporal si fue creado
-    if temp_profile_to_cleanup:
-        def _cleanup_temp_profile(path=temp_profile_to_cleanup):
-            try:
-                shutil.rmtree(path, ignore_errors=True)
-                # print(f"   ✓ Perfil temporal eliminado: {path}")
-            except Exception:
-                pass
-
-        atexit.register(_cleanup_temp_profile)
     return driver
 
 
 def login_facebook(driver: webdriver.Edge, email: str, password: str) -> bool:
     """Inicia sesión en Facebook con comportamiento humano. Retorna True si tiene éxito."""
     print("🌐 Navegando a Facebook...")
-    driver.get("https://www.facebook.com/")
-    wait_for_page_load(driver)
+    if not navigate_with_retries(driver, "https://www.facebook.com/", retries=2):
+        print("✗ No se pudo abrir Facebook por inestabilidad del navegador.")
+        return False
     HumanBehavior.random_delay(2, 4)
     
     # Movimientos iniciales aleatorios del ratón
@@ -619,7 +792,14 @@ def keep_session_alive_during_pause(driver: webdriver.Edge, total_minutes: int) 
         return False
 
 
-def post_to_group(driver: webdriver.Edge, group_id: str, message: str, images: List[str] = None) -> bool:
+def post_to_group(
+    driver: webdriver.Edge,
+    group_id: str,
+    message: str,
+    images: List[str] = None,
+    debug_on_failure: bool = False,
+    account_name: str = "Cuenta principal",
+) -> bool:
     """Publica en un grupo de Facebook con comportamiento humano mejorado."""
     group_url = f"https://www.facebook.com/groups/{group_id}"
     print(f"\n🌐 Navegando al grupo: {group_url}")
@@ -628,6 +808,8 @@ def post_to_group(driver: webdriver.Edge, group_id: str, message: str, images: L
         driver.get(group_url)
     except Exception as e:
         print(f"✗ Timeout cargando el grupo {group_id}, saltando: {e}")
+        if debug_on_failure:
+            capture_failure_artifacts(driver, group_id, "navigation_failed", account_name)
         return False
 
     print("⏳ Esperando a que cargue la página...")
@@ -662,18 +844,40 @@ def post_to_group(driver: webdriver.Edge, group_id: str, message: str, images: L
         for i, selector in enumerate(create_post_selectors):
             try:
                 print(f"   Intentando selector {i+1}/{len(create_post_selectors)}...")
-                post_box = WebDriverWait(driver, 8).until(
-                    EC.element_to_be_clickable((By.XPATH, selector))
+                WebDriverWait(driver, 8).until(
+                    EC.presence_of_element_located((By.XPATH, selector))
                 )
-                selected_create_selector = selector
-                print(f"   ✓ Encontrado con selector: {selector}")
-                break
+                candidates = driver.find_elements(By.XPATH, selector)
+                for candidate in candidates:
+                    if not candidate.is_displayed() or not candidate.is_enabled():
+                        continue
+
+                    # Evitar botones dentro de publicaciones existentes (comentarios/reacciones).
+                    inside_article = driver.execute_script(
+                        "return !!arguments[0].closest('div[role=\"article\"]');",
+                        candidate,
+                    )
+                    if inside_article:
+                        continue
+
+                    post_box = candidate
+                    selected_create_selector = selector
+                    print(f"   ✓ Encontrado con selector: {selector}")
+                    break
+
+                if post_box:
+                    break
             except TimeoutException:
                 continue
         
         if not post_box:
+            block_code, block_message = detect_group_posting_block_reason(driver)
             print(f"✗ No se encontró el área de publicación en el grupo {group_id}")
-            print("   Puede que no tengas permisos o la sesión no esté activa.")
+            print(f"   ⚠️ Motivo detectado: {block_message}")
+            if block_code == "unknown":
+                print("   Puede que no tengas permisos, requiera aprobación o la sesión no esté activa.")
+            if debug_on_failure:
+                capture_failure_artifacts(driver, group_id, f"post_box_not_found_{block_code}", account_name)
             return False
         
         # ═══ CLICK CON COMPORTAMIENTO HUMANO + RETRY ANTI-STALE ═══
@@ -700,6 +904,8 @@ def post_to_group(driver: webdriver.Edge, group_id: str, message: str, images: L
 
         if not clicked_post_box:
             print("✗ No se pudo hacer click en el área de publicación tras varios intentos")
+            if debug_on_failure:
+                capture_failure_artifacts(driver, group_id, "post_box_click_failed", account_name)
             return False
 
         HumanBehavior.random_delay(2, 3)
@@ -710,6 +916,7 @@ def post_to_group(driver: webdriver.Edge, group_id: str, message: str, images: L
         
         # Esperar a que aparezca el modal/diálogo de crear publicación
         print("⏳ Esperando modal de publicación...")
+        modal = None
         try:
             modal = WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.XPATH, "//div[@role='dialog']"))
@@ -722,10 +929,9 @@ def post_to_group(driver: webdriver.Edge, group_id: str, message: str, images: L
         
         # Esperar a que aparezca el editor de publicación dentro del modal
         editor_selectors = [
+            "//div[@role='dialog']//div[@role='textbox' and @contenteditable='true']",
+            "//div[@role='dialog']//div[@contenteditable='true' and @role='textbox']",
             "//div[@role='dialog']//div[@contenteditable='true']",
-            "//div[@role='dialog']//div[@role='textbox']",
-            "//div[@contenteditable='true' and contains(@aria-label, 'público')]",
-            "//div[@contenteditable='true'][@role='textbox']",
         ]
         
         editor = None
@@ -733,16 +939,48 @@ def post_to_group(driver: webdriver.Edge, group_id: str, message: str, images: L
         for i, selector in enumerate(editor_selectors):
             try:
                 print(f"   Intentando selector {i+1}/{len(editor_selectors)}...")
-                editor = WebDriverWait(driver, 10).until(
+                WebDriverWait(driver, 10).until(
                     EC.presence_of_element_located((By.XPATH, selector))
                 )
-                print(f"   ✓ Editor encontrado")
-                break
+
+                candidates = driver.find_elements(By.XPATH, selector)
+                for candidate in candidates:
+                    if not candidate.is_displayed() or not candidate.is_enabled():
+                        continue
+
+                    aria_label = (candidate.get_attribute("aria-label") or "").lower()
+                    placeholder = (candidate.get_attribute("data-placeholder") or "").lower()
+                    combined_text = f"{aria_label} {placeholder}"
+
+                    # Excluir cajas de comentario/respuesta explícitas.
+                    if any(token in combined_text for token in ["coment", "comment", "reply", "responde"]):
+                        continue
+
+                    # Confirmar que el editor pertenece al modal que contiene el botón Publicar/Post.
+                    has_publish_button = driver.execute_script(
+                        """
+                        const dialog = arguments[0].closest('div[role="dialog"]');
+                        if (!dialog) return false;
+                        return !!dialog.querySelector('div[role="button"][aria-label="Publicar"], div[role="button"][aria-label="Post"]');
+                        """,
+                        candidate,
+                    )
+                    if not has_publish_button:
+                        continue
+
+                    editor = candidate
+                    print(f"   ✓ Editor encontrado")
+                    break
+
+                if editor:
+                    break
             except TimeoutException:
                 continue
         
         if not editor:
             print("✗ No se encontró el editor de texto")
+            if debug_on_failure:
+                capture_failure_artifacts(driver, group_id, "editor_not_found", account_name)
             return False
         
         # ═══ ESCRIBIR MENSAJE CON COMPORTAMIENTO HUMANO ═══
@@ -862,6 +1100,9 @@ def post_to_group(driver: webdriver.Edge, group_id: str, message: str, images: L
                             
                     except Exception as e:
                         print(f"   ✗ Error subiendo imagen {idx}: {e}")
+                        if is_session_lost_error(e):
+                            print("   ✗ Sesión/ventana del navegador perdida durante la subida de imágenes")
+                            return False
                         traceback.print_exc()
                 else:
                     print(f"   ✗ Imagen no encontrada: {img_path}")
@@ -895,6 +1136,8 @@ def post_to_group(driver: webdriver.Edge, group_id: str, message: str, images: L
         
         if not publish_btn:
             print("✗ No se encontró el botón de publicar")
+            if debug_on_failure:
+                capture_failure_artifacts(driver, group_id, "publish_button_not_found", account_name)
             return False
         
         # Click con comportamiento humano + retry anti-stale
@@ -917,6 +1160,8 @@ def post_to_group(driver: webdriver.Edge, group_id: str, message: str, images: L
 
         if not clicked_publish_btn:
             print("✗ No se pudo hacer click en el botón Publicar tras varios intentos")
+            if debug_on_failure:
+                capture_failure_artifacts(driver, group_id, "publish_click_failed", account_name)
             return False
 
         print("⏳ Esperando confirmación de publicación...")
@@ -939,6 +1184,10 @@ def post_to_group(driver: webdriver.Edge, group_id: str, message: str, images: L
         
     except Exception as e:
         print(f"✗ Error publicando en grupo {group_id}: {e}")
+        if debug_on_failure:
+            capture_failure_artifacts(driver, group_id, "exception_during_post", account_name)
+        if is_session_lost_error(e):
+            print("   ⚠️ Se detectó pérdida de sesión/ventana; se intentará recuperar en el siguiente grupo")
         return False
 
 
@@ -949,7 +1198,7 @@ def load_config(path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
-def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int) -> tuple[int, int]:
+def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int, cli_debug_on_failure: bool = False) -> tuple[int, int]:
     """Ejecuta la automatización completa para una sola cuenta."""
     account_name = account_cfg.get("name", "Cuenta principal")
 
@@ -958,6 +1207,8 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int) -> tupl
     profile_path = account_cfg.get("edge_profile_path")
     default_message = account_cfg.get("default_message", "")
     groups = account_cfg.get("groups", [])
+    debug_on_failure = bool(account_cfg.get("debug_on_failure", False) or cli_debug_on_failure)
+    force_close_edge = bool(account_cfg.get("force_close_edge_before_start", True))
 
     if not groups:
         print("✗ No hay grupos configurados para esta cuenta")
@@ -970,9 +1221,16 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int) -> tupl
     print(f"\n{'═'*60}")
     print(f"  Iniciando [{account_name}] - {len(groups)} grupo(s)")
     print(f"{'═'*60}\n")
+    if debug_on_failure:
+        print("🧪 Debug de fallos activado (capturas + HTML + metadatos)")
 
     driver = None
     try:
+        if profile_path and force_close_edge:
+            print("🧹 Cerrando procesos Edge previos para liberar el perfil...")
+            cleanup_edge_processes()
+            HumanBehavior.random_delay(1, 2)
+
         driver = create_driver(headless=headless, profile_path=profile_path)
 
         # Login si no hay perfil con sesión
@@ -982,13 +1240,98 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int) -> tupl
                 return (0, len(groups))
         else:
             print("🌐 Verificando sesión existente...")
-            driver.get("https://www.facebook.com/")
-            wait_for_page_load(driver)
+            opened = False
+            for startup_attempt in range(1, 3):
+                if navigate_with_retries(driver, "https://www.facebook.com/", retries=2):
+                    opened = True
+                    break
+
+                if startup_attempt < 2:
+                    print("   🔄 Reiniciando navegador por error de renderer...")
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                    HumanBehavior.random_delay(2, 4)
+                    driver = create_driver(headless=headless, profile_path=profile_path)
+
+            if not opened:
+                if profile_path and force_close_edge:
+                    print("   🧹 Reintentando con limpieza adicional de procesos Edge...")
+                    cleanup_edge_processes()
+                    HumanBehavior.random_delay(1, 2)
+                    try:
+                        if driver:
+                            driver.quit()
+                    except Exception:
+                        pass
+                    driver = create_driver(headless=headless, profile_path=profile_path)
+                    if navigate_with_retries(driver, "https://www.facebook.com/", retries=2):
+                        opened = True
+
+            if not opened:
+                print("✗ No se pudo abrir Facebook tras reintentos. Revisa Edge/driver y procesos abiertos.")
+                return (0, len(groups))
+
             HumanBehavior.random_delay(2, 4)
             if not is_logged_in(driver):
-                print("✗ El perfil de Edge no tiene sesión activa. Inicia sesión manualmente primero.")
-                return (0, len(groups))
+                print("⚠️ El perfil de Edge no tiene sesión activa.")
+                if email and password:
+                    print("🔐 Intentando login automático con credenciales del config...")
+                    if not login_facebook(driver, email, password):
+                        print("✗ No se pudo iniciar sesión automáticamente.")
+                        return (0, len(groups))
+                    print("✓ Login automático exitoso; la sesión quedará guardada en el perfil.")
+                else:
+                    print("✗ No hay credenciales disponibles en config para recuperar sesión automáticamente.")
+                    print("  Ejecuta setup_session.py o agrega email/password en la cuenta.")
+                    return (0, len(groups))
             print("✓ Sesión activa detectada")
+
+        def recover_driver_session() -> bool:
+            """Recrea navegador y valida sesión para continuar el lote sin abortar toda la cuenta."""
+            nonlocal driver
+            print("   🔄 Recreando navegador por sesión inválida...")
+            try:
+                if driver:
+                    driver.quit()
+            except Exception:
+                pass
+
+            HumanBehavior.random_delay(2, 4)
+            driver = create_driver(headless=headless, profile_path=profile_path)
+            if not navigate_with_retries(driver, "https://www.facebook.com/", retries=2):
+                if profile_path and force_close_edge:
+                    print("   🧹 Limpieza de procesos y segundo intento de recuperación...")
+                    cleanup_edge_processes()
+                    HumanBehavior.random_delay(1, 2)
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                    driver = create_driver(headless=headless, profile_path=profile_path)
+                    if navigate_with_retries(driver, "https://www.facebook.com/", retries=2):
+                        pass
+                    else:
+                        print("   ✗ No se pudo abrir Facebook tras recrear el navegador")
+                        return False
+                else:
+                    print("   ✗ No se pudo abrir Facebook tras recrear el navegador")
+                    return False
+
+            HumanBehavior.random_delay(2, 4)
+            if is_logged_in(driver):
+                print("   ✓ Sesión recuperada con perfil persistente")
+                return True
+
+            if email and password:
+                print("   🔐 Recuperando sesión con login automático...")
+                if login_facebook(driver, email, password):
+                    print("   ✓ Sesión recuperada por login")
+                    return True
+
+            print("   ✗ No se pudo recuperar la sesión automáticamente")
+            return False
 
         # Publicar en cada grupo
         success_count = 0
@@ -1022,6 +1365,11 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int) -> tupl
                     group_id = group.get("id")
                     if not group_id:
                         continue
+
+                    if not is_driver_alive(driver):
+                        if not recover_driver_session():
+                            print("✗ Abortando cuenta: no se pudo recuperar el navegador")
+                            return (success_count, total_groups)
                     
                     # Calcular posición global
                     global_pos = (batch_num - 1) * batch_size + i
@@ -1031,7 +1379,14 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int) -> tupl
                     message = group.get("message") or default_message
                     images = group.get("images", [])
                     
-                    if post_to_group(driver, group_id, message, images):
+                    if post_to_group(
+                        driver,
+                        group_id,
+                        message,
+                        images,
+                        debug_on_failure=debug_on_failure,
+                        account_name=account_name,
+                    ):
                         success_count += 1
                         print(f"✓ [{global_pos}/{total_groups}] Publicación exitosa")
                     else:
@@ -1069,12 +1424,24 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int) -> tupl
                 if not group_id:
                     continue
 
+                if not is_driver_alive(driver):
+                    if not recover_driver_session():
+                        print("✗ Abortando cuenta: no se pudo recuperar el navegador")
+                        return (success_count, total_groups)
+
                 print(f"[{i}/{total_groups}] Procesando grupo: {group_id}")
 
                 message = group.get("message") or default_message
                 images = group.get("images", [])
 
-                if post_to_group(driver, group_id, message, images):
+                if post_to_group(
+                    driver,
+                    group_id,
+                    message,
+                    images,
+                    debug_on_failure=debug_on_failure,
+                    account_name=account_name,
+                ):
                     success_count += 1
                     print(f"✓ [{i}/{total_groups}] Publicación exitosa")
                 else:
@@ -1112,6 +1479,8 @@ def main():
     parser.add_argument("--headless", action="store_true", help="Ejecutar sin ventana visible (puede fallar más)")
     parser.add_argument("--delay", "-d", type=int, default=15,
                        help="Segundos mínimos entre publicaciones (default: 15)")
+    parser.add_argument("--debug-on-failure", action="store_true",
+                       help="Guardar evidencia de fallos (screenshot, HTML y metadata) en debug_failures/")
     args = parser.parse_args()
 
     print("\n" + "═"*60)
@@ -1145,7 +1514,12 @@ def main():
         print("⚠️ Se detectaron múltiples cuentas activas; en este modo se usará solo la primera.")
 
     selected_account = active_accounts[0]
-    success_count, total_groups = run_account(selected_account, args.headless, args.delay)
+    success_count, total_groups = run_account(
+        selected_account,
+        args.headless,
+        args.delay,
+        cli_debug_on_failure=args.debug_on_failure,
+    )
 
     print(f"\n{'═'*60}")
     print("  RESUMEN GLOBAL")

@@ -99,6 +99,32 @@ python post_to_groups_selenium.py --config config.json
 python post_to_groups_selenium.py --config config.json --delay 30
 ```
 
+### Debug de fallos (capturas + HTML):
+
+Puedes activar evidencia automática cuando una publicación falle:
+
+```powershell
+python post_to_groups_selenium.py --config config.json --debug-on-failure
+```
+
+También puedes dejarlo fijo por cuenta en `config.json`:
+
+```json
+{
+  "accounts": [
+    {
+      "name": "Cuenta Principal",
+      "debug_on_failure": true
+    }
+  ]
+}
+```
+
+Cuando falle un grupo, se guardará evidencia en `debug_failures/AAAAmmdd/`:
+- screenshot `.png`
+- HTML completo `.html`
+- metadata `.txt` (URL, título, reason, estado de sesión)
+
 ---
 
 ## Programar Ejecución Automática
@@ -158,6 +184,17 @@ El script incluye medidas anti-detección:
 2. **Prueba manualmente primero** - haz una publicación manual con el mismo contenido
 3. **Revisa tu cuenta** - verifica si tienes restricciones activas
 
+### Diagnóstico de grupos donde no aparece "Escribe algo":
+
+El script ahora intenta detectar y reportar una causa específica cuando no encuentra
+el área de publicación, por ejemplo:
+- Sin permisos para publicar
+- Publicación pendiente de aprobación
+- Debes unirte al grupo
+- Sesión inactiva/login
+
+Si además usas `--debug-on-failure`, tendrás screenshot + HTML + metadata para confirmar el motivo.
+
 ### Si Edge no abre:
 
 1. Cierra todas las ventanas de Edge abiertas
@@ -189,6 +226,8 @@ Las ejecuciones automáticas generan un log en `task_log.txt` con:
 - Hora de inicio y fin
 - Grupos procesados
 - Errores encontrados
+
+Con `--debug-on-failure` también se genera evidencia detallada en `debug_failures/`.
 
 ---
 
