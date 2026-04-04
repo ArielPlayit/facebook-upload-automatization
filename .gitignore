@@ -25,3 +25,9 @@ tmpclaude-*
 
 #Debug Folder
 debug_failures/
+
+# Headless CI subproject
+headless_ci_facebook/runtime/
+headless_ci_facebook/config.json
+headless_ci_facebook/config.local.json
+headless_ci_facebook/debug_artifacts/
