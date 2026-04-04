@@ -28,6 +28,10 @@ Riesgos:
 | `install_edgedriver.py` | Instala EdgeDriver automáticamente |
 | `config.example.json` | Ejemplo de configuración |
 | `config.json` | Tu configuración (no subir a git) |
+| `app_models.py` | Modelos tipados de configuración |
+| `app_config.py` | Carga, parseo y validación de configuración |
+| `app_runner.py` | Orquestación de ejecución de la aplicación |
+| `HOSTING.md` | Guía para ejecutar 24/7 sin tu PC encendida |
 
 ---
 
@@ -38,6 +42,19 @@ cd "C:\Users\ArielPlayit\Documents\Proyectos\facebook-upload-automatization"
 pip install -r requirements.txt
 python install_edgedriver.py
 ```
+
+---
+
+## Arquitectura (versión actual)
+
+El proyecto ahora está separado en capas para facilitar mantenimiento:
+
+- `post_to_groups_selenium.py`: infraestructura Selenium y lógica de interacción con Facebook
+- `app_config.py`: lectura/validación de configuración (`config.json`)
+- `app_models.py`: estructuras de datos de configuración
+- `app_runner.py`: flujo de aplicación (selección de cuenta activa y ejecución)
+
+Este cambio reduce acoplamiento, mejora testeabilidad y hace más sencillo extender funcionalidades sin romper la automatización principal.
 
 ---
 
@@ -57,15 +74,29 @@ Copy-Item config.example.json config.json
   "password": "tu_contraseña",
   "edge_profile_path": "C:/Users/TuUsuario/.../edge_profile",
   "default_message": "Tu mensaje aquí",
+  "default_images": [
+    "C:/ruta/a/imagen1.jpg",
+    "C:/ruta/a/imagen2.jpg"
+  ],
+  "randomize_images_order": true,
   "groups": [
     {
-      "id": "ID_DEL_GRUPO",
+      "id": "ID_DEL_GRUPO"
+    },
+    {
+      "id": "OTRO_ID",
       "message": "Mensaje específico (opcional)",
-      "images": ["C:/ruta/a/imagen.jpg"]
+      "images": ["C:/ruta/a/imagen-especifica.jpg"]
     }
   ]
 }
 ```
+
+Notas rápidas:
+- `default_message` y `default_images` viven una sola vez por cuenta.
+- Cada grupo puede omitir `message/images` y hereda los valores por defecto.
+- Si `randomize_images_order` es `true`, el orden de imágenes se mezcla en cada publicación.
+- El script sigue validando que cada archivo exista antes de subirlo.
 
 ### ¿Cómo obtener el ID del grupo?
 
@@ -155,6 +186,18 @@ Get-ScheduledTask -TaskName "FacebookAutoPost*"
 Unregister-ScheduledTask -TaskName "FacebookAutoPost_9AM" -Confirm:$false
 Unregister-ScheduledTask -TaskName "FacebookAutoPost_8PM" -Confirm:$false
 ```
+
+---
+
+## Ejecutar sin tu PC encendida
+
+Revisa la guía completa en `HOSTING.md`.
+
+Recomendación práctica para este tipo de proyecto:
+
+- usar una **VM Windows 24/7** (Azure, AWS, Contabo, etc.)
+- configurar sesión con `setup_session.py`
+- programar con Task Scheduler
 
 ---
 

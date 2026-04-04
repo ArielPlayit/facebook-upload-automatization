@@ -17,6 +17,7 @@ build/
 
 # Logs
 *.log
+task_log_failed_groups_test.txt
 task_log.txt
 
 # Archivos temporales de Claude

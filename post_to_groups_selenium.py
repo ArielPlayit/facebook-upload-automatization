@@ -14,7 +14,6 @@ MEJORAS ANTI-DETECCIÓN v2.0:
 """
 
 import argparse
-import json
 import os
 import sys
 import time
@@ -46,6 +45,8 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException,
 from selenium.webdriver import ActionChains
 import pyperclip
 
+from app_runner import run_single_account_from_config
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CLASE DE COMPORTAMIENTO HUMANO
@@ -55,7 +56,7 @@ class HumanBehavior:
     """Clase para simular comportamiento humano realista en automatización."""
     
     @staticmethod
-    def random_delay(min_sec: float = 1.0, max_sec: float = 3.0):
+    def random_delay(min_sec: float = 0.8, max_sec: float = 2.2):
         """
         Delay con distribución gaussiana (más realista que uniform).
         Los humanos tienden a tener tiempos de respuesta con distribución normal.
@@ -163,7 +164,7 @@ class HumanBehavior:
         Incluye pausas en puntuación y probabilidad de errores de tipeo.
         """
         if wpm is None:
-            wpm = random.randint(40, 80)
+            wpm = random.randint(55, 90)
         
         # Calcular delay base por caracter (WPM -> segundos por caracter)
         # Promedio de 5 caracteres por palabra
@@ -908,7 +909,7 @@ def post_to_group(
                 capture_failure_artifacts(driver, group_id, "post_box_click_failed", account_name)
             return False
 
-        HumanBehavior.random_delay(2, 3)
+        HumanBehavior.random_delay(1.2, 2)
         
         # Simular más comportamiento humano después del click
         driver.execute_script("window.scrollBy(0, 50)")
@@ -1008,7 +1009,7 @@ def post_to_group(
                 action = ActionChains(driver)
                 action.key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
 
-                HumanBehavior.random_delay(2, 3)
+                HumanBehavior.random_delay(1.2, 2)
 
             # Verificar que se pegó correctamente
             text_content = driver.execute_script("return arguments[0].textContent || arguments[0].innerText;", editor)
@@ -1051,7 +1052,7 @@ def post_to_group(
                     except:
                         pass
         
-        HumanBehavior.random_delay(2, 3)
+        HumanBehavior.random_delay(1.2, 2)
         
         # ═══ SUBIR IMÁGENES CON VERIFICACIÓN DE PREVIEW ═══
         if images:
@@ -1191,13 +1192,6 @@ def post_to_group(
         return False
 
 
-def load_config(path: str) -> Dict[str, Any]:
-    """Carga configuración desde archivo JSON."""
-    # utf-8-sig permite leer archivos con o sin BOM (comun en Windows/VS Code).
-    with open(path, "r", encoding="utf-8-sig") as f:
-        return json.load(f)
-
-
 def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int, cli_debug_on_failure: bool = False) -> tuple[int, int]:
     """Ejecuta la automatización completa para una sola cuenta."""
     account_name = account_cfg.get("name", "Cuenta principal")
@@ -1206,6 +1200,8 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int, cli_deb
     password = account_cfg.get("password")
     profile_path = account_cfg.get("edge_profile_path")
     default_message = account_cfg.get("default_message", "")
+    default_images = [str(path) for path in account_cfg.get("default_images", [])]
+    randomize_images_order = bool(account_cfg.get("randomize_images_order", False))
     groups = account_cfg.get("groups", [])
     debug_on_failure = bool(account_cfg.get("debug_on_failure", False) or cli_debug_on_failure)
     force_close_edge = bool(account_cfg.get("force_close_edge_before_start", True))
@@ -1377,7 +1373,13 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int, cli_deb
                     print(f"[{global_pos}/{total_groups}] Procesando grupo: {group_id}")
                     
                     message = group.get("message") or default_message
-                    images = group.get("images", [])
+                    images = group.get("images")
+                    if images is None:
+                        images = list(default_images)
+                    else:
+                        images = list(images)
+                    if randomize_images_order and images:
+                        random.shuffle(images)
                     
                     if post_to_group(
                         driver,
@@ -1422,7 +1424,7 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int, cli_deb
             for i, group in enumerate(groups, 1):
                 group_id = group.get("id")
                 if not group_id:
-                    continue
+                    continue                                                    
 
                 if not is_driver_alive(driver):
                     if not recover_driver_session():
@@ -1432,7 +1434,13 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int, cli_deb
                 print(f"[{i}/{total_groups}] Procesando grupo: {group_id}")
 
                 message = group.get("message") or default_message
-                images = group.get("images", [])
+                images = group.get("images")
+                if images is None:
+                    images = list(default_images)
+                else:
+                    images = list(images)
+                if randomize_images_order and images:
+                    random.shuffle(images)
 
                 if post_to_group(
                     driver,
@@ -1491,40 +1499,29 @@ def main():
         print(f"✗ Archivo de configuración no encontrado: {args.config}")
         sys.exit(1)
 
-    cfg = load_config(args.config)
-    print(f"✓ Configuración cargada: {args.config}")
-
-    # Soporte para formato antiguo (una cuenta) y formato con "accounts".
-    # En modo single-account solo se ejecuta la primera cuenta activa.
-    if "accounts" in cfg:
-        accounts = cfg.get("accounts", [])
-    else:
-        accounts = [cfg]
-
-    active_accounts = [a for a in accounts if not a.get("suspended", False)]
-
-    print(f"✓ {len(accounts)} cuenta(s) configurada(s)")
-    print(f"✓ {len(active_accounts)} cuenta(s) activa(s)")
-
-    if not active_accounts:
-        print("✗ No hay cuentas activas. Revisa el campo 'suspended' en el config.")
+    try:
+        result = run_single_account_from_config(
+            config_path=args.config,
+            headless=args.headless,
+            delay=args.delay,
+            cli_debug_on_failure=args.debug_on_failure,
+            run_account_callable=run_account,
+        )
+    except ValueError as config_error:
+        print(f"✗ Configuración inválida: {config_error}")
         sys.exit(1)
 
-    if len(active_accounts) > 1:
-        print("⚠️ Se detectaron múltiples cuentas activas; en este modo se usará solo la primera.")
+    print(f"✓ Configuración cargada: {args.config}")
+    print(f"✓ {result.configured_accounts} cuenta(s) configurada(s)")
+    print(f"✓ {result.active_accounts} cuenta(s) activa(s)")
 
-    selected_account = active_accounts[0]
-    success_count, total_groups = run_account(
-        selected_account,
-        args.headless,
-        args.delay,
-        cli_debug_on_failure=args.debug_on_failure,
-    )
+    if result.multiple_accounts_detected:
+        print("⚠️ Se detectaron múltiples cuentas activas; en este modo se usará solo la primera.")
 
     print(f"\n{'═'*60}")
     print("  RESUMEN GLOBAL")
     print(f"{'═'*60}")
-    print(f"  [{selected_account.get('name', 'Cuenta principal')}]: {success_count}/{total_groups} publicaciones exitosas")
+    print(f"  [{result.selected_account_name}]: {result.success_count}/{result.total_groups} publicaciones exitosas")
     print(f"{'═'*60}\n")
 
 

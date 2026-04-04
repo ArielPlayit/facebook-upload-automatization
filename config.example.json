@@ -7,18 +7,17 @@
       "edge_profile_path": "C:/ruta/a/edge_profile",
       "debug_on_failure": false,
       "default_message": "Hola! Este es un post automatizado.",
+      "default_images": [
+        "C:/ruta/a/imagen1.jpg",
+        "C:/ruta/a/imagen2.png"
+      ],
+      "randomize_images_order": true,
       "groups": [
         {
-          "id": "ID_DEL_GRUPO",
-          "message": "Mensaje específico para este grupo (opcional)",
-          "images": [
-            "C:/ruta/a/imagen1.jpg",
-            "C:/ruta/a/imagen2.png"
-          ]
+          "id": "ID_DEL_GRUPO"
         },
         {
-          "id": "OTRO_ID_DE_GRUPO",
-          "images": []
+          "id": "OTRO_ID_DE_GRUPO"
         }
       ]
     },
@@ -29,13 +28,14 @@
       "edge_profile_path": "C:/ruta/a/edge_profile2",
       "debug_on_failure": false,
       "default_message": "Hola desde la cuenta 2!",
+      "default_images": [
+        "C:/ruta/a/otras/imagenes/foto.jpg"
+      ],
+      "randomize_images_order": false,
       "groups": [
         {
           "id": "ID_GRUPO_CUENTA2",
-          "message": "Mensaje para la cuenta 2",
-          "images": [
-            "C:/ruta/a/otras/imagenes/foto.jpg"
-          ]
+          "message": "Mensaje para la cuenta 2"
         }
       ]
     }
