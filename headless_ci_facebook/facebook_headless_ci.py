@@ -295,81 +295,13 @@ def apply_cookies_and_restore_session(driver: webdriver.Remote, cookies: list[di
 
 def login_with_credentials(driver: webdriver.Remote, email: str, password: str) -> bool:
     print("[info] Intentando login con credenciales...")
-    if not navigate_with_retries(driver, "https://www.facebook.com/login", retries=2):
+    if not navigate_with_retries(driver, "https://www.facebook.com/", retries=2):
         return False
 
     try:
-        cookie_selectors = [
-            "//button[@data-cookiebanner='accept_button']",
-            "//button[contains(., 'Allow all cookies')]",
-            "//button[contains(., 'Permitir todas las cookies')]",
-            "//span[contains(., 'Allow all cookies')]/ancestor::button[1]",
-            "//span[contains(., 'Permitir todas las cookies')]/ancestor::button[1]",
-        ]
-        for selector in cookie_selectors:
-            try:
-                cookie_btn = WebDriverWait(driver, 2).until(
-                    EC.element_to_be_clickable((By.XPATH, selector))
-                )
-                cookie_btn.click()
-                random_delay(0.3, 0.8)
-                break
-            except Exception:
-                continue
-
-        email_field = None
-        for by, selector in [
-            (By.ID, "email"),
-            (By.NAME, "email"),
-            (By.CSS_SELECTOR, "input[name='email']"),
-            (By.CSS_SELECTOR, "input[type='text'][autocomplete='username']"),
-        ]:
-            try:
-                email_field = WebDriverWait(driver, 8).until(
-                    EC.presence_of_element_located((by, selector))
-                )
-                break
-            except TimeoutException:
-                continue
-
-        pass_field = None
-        for by, selector in [
-            (By.ID, "pass"),
-            (By.NAME, "pass"),
-            (By.CSS_SELECTOR, "input[name='pass']"),
-            (By.CSS_SELECTOR, "input[type='password']"),
-        ]:
-            try:
-                pass_field = WebDriverWait(driver, 8).until(
-                    EC.presence_of_element_located((by, selector))
-                )
-                break
-            except TimeoutException:
-                continue
-
-        login_button = None
-        for by, selector in [
-            (By.NAME, "login"),
-            (By.CSS_SELECTOR, "button[name='login']"),
-            (By.XPATH, "//button[@name='login']"),
-            (By.XPATH, "//div[@role='button' and (@aria-label='Iniciar sesión' or @aria-label='Log in')]")
-        ]:
-            try:
-                login_button = WebDriverWait(driver, 8).until(
-                    EC.element_to_be_clickable((by, selector))
-                )
-                break
-            except TimeoutException:
-                continue
-
-        if not email_field or not pass_field or not login_button:
-            print("[warn] No se encontro el formulario de login completo.")
-            try:
-                print(f"[warn] URL actual: {driver.current_url}")
-            except Exception:
-                pass
-            capture_debug_artifacts(driver, "auth", "login_form_not_found")
-            return False
+        email_field = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "email")))
+        pass_field = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "pass")))
+        login_button = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.NAME, "login")))
 
         email_field.clear()
         email_field.send_keys(email)
@@ -379,42 +311,18 @@ def login_with_credentials(driver: webdriver.Remote, email: str, password: str) 
         pass_field.send_keys(password)
         random_delay(0.2, 0.6)
 
-        try:
-            login_button.click()
-        except Exception:
-            driver.execute_script("arguments[0].click();", login_button)
+        login_button.click()
         wait_for_page_load(driver)
         random_delay(2.0, 3.0)
-
-        current_url = ""
-        try:
-            current_url = driver.current_url.lower()
-        except Exception:
-            current_url = ""
-
-        if "checkpoint" in current_url:
-            print("[warn] Facebook solicito checkpoint/2FA despues del login.")
-            capture_debug_artifacts(driver, "auth", "checkpoint_after_login")
-            return False
 
         if is_logged_in(driver):
             print("[ok] Login exitoso con credenciales.")
             return True
 
         print("[warn] Login no confirmado. Puede haber 2FA o checkpoint.")
-        try:
-            print(f"[warn] URL actual tras login: {driver.current_url}")
-        except Exception:
-            pass
-        capture_debug_artifacts(driver, "auth", "login_not_confirmed")
         return False
     except Exception as err:
         print(f"[warn] Error durante login: {err}")
-        try:
-            print(f"[warn] URL en excepcion de login: {driver.current_url}")
-        except Exception:
-            pass
-        capture_debug_artifacts(driver, "auth", "login_exception")
         return False
 
 
