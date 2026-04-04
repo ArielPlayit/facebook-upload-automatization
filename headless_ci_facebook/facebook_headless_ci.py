@@ -108,20 +108,12 @@ def normalize_groups(raw_groups: Any) -> list[dict[str, Any]]:
 
 def resolve_image_paths(image_paths: list[str], config_dir: Path) -> list[str]:
     resolved: list[str] = []
-    script_dir = Path(__file__).resolve().parent
     for raw_path in image_paths:
         if not isinstance(raw_path, str) or not raw_path.strip():
             continue
         candidate = Path(raw_path)
         if not candidate.is_absolute():
-            from_config_dir = (config_dir / candidate).resolve()
-            from_script_dir = (script_dir / candidate).resolve()
-            if from_config_dir.exists():
-                candidate = from_config_dir
-            elif from_script_dir.exists():
-                candidate = from_script_dir
-            else:
-                candidate = from_config_dir
+            candidate = (config_dir / candidate).resolve()
         resolved.append(str(candidate))
     return resolved
 
