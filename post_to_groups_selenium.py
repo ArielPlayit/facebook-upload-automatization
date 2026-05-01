@@ -19,12 +19,18 @@ import sys
 import time
 import random
 import string
+import tempfile
 import traceback
 import threading
 import re
 import subprocess
 from datetime import datetime
 from pathlib import Path
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 # Forzar UTF-8 en stdout/stderr para evitar errores en consola de Windows
 if hasattr(sys.stdout, 'reconfigure'):
@@ -45,7 +51,18 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException,
 from selenium.webdriver import ActionChains
 import pyperclip
 
-from app_runner import run_single_account_from_config
+from app_runner import run_accounts_from_config
+
+
+LIMITED_PRODUCTS_RANDOM_GROUPS_COUNT = 20
+LIMITED_PRODUCTS_KEYWORDS = ("creatina", "shaker")
+LIMITED_PRODUCTS_PROMO_MESSAGE = (
+    "🔥 OFERTA ESPECIAL DE SUPLEMENTACIÓN 🔥\n\n"
+    "⚡ Creatina (60 servicios, 5g c/u) — $20 USD | Más fuerza y mejor recuperación\n"
+    "🥤 Shaker para proteínas — $9 USD | Mezcla perfecta sin grumos\n\n"
+    "📦 ¡Hacemos domicilio!\n"
+    "📩 Escríbenos por Messenger para pedir el tuyo"
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -523,6 +540,134 @@ CDP_ANTI_DETECTION_SCRIPT = """
 _clipboard_lock = threading.Lock()
 
 
+def _is_truthy_env(env_name: str) -> bool:
+    return os.getenv(env_name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _wait_for_parallel_browsers_ready(account_name: str) -> None:
+    ready_dir_raw = os.getenv("FB_PARALLEL_READY_DIR", "").strip()
+    if not ready_dir_raw:
+        return
+
+    try:
+        expected_ready = int(os.getenv("FB_PARALLEL_EXPECTED_READY", "1").strip() or "1")
+    except ValueError:
+        expected_ready = 1
+
+    if expected_ready <= 1:
+        return
+
+    try:
+        timeout_sec = float(os.getenv("FB_PARALLEL_READY_TIMEOUT", "90").strip() or "90")
+    except ValueError:
+        timeout_sec = 90.0
+
+    ready_dir = Path(ready_dir_raw)
+    try:
+        ready_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"   ADVERTENCIA: no se pudo crear barrera paralela: {exc}")
+        return
+
+    raw_ready_name = os.getenv("FB_PARALLEL_READY_NAME", "").strip() or account_name or str(os.getpid())
+    safe_ready_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw_ready_name).strip("._")
+    if not safe_ready_name:
+        safe_ready_name = f"pid_{os.getpid()}"
+
+    marker_path = ready_dir / f"{safe_ready_name}_{os.getpid()}.ready"
+    marker_content = "\n".join(
+        [
+            f"account={account_name}",
+            f"pid={os.getpid()}",
+            f"ready_at={datetime.now().isoformat(timespec='seconds')}",
+        ]
+    )
+
+    try:
+        marker_path.write_text(marker_content, encoding="utf-8")
+    except OSError as exc:
+        print(f"   ADVERTENCIA: no se pudo marcar navegador listo: {exc}")
+        return
+
+    print(f"   Navegador listo para [{account_name}]. Esperando las demas cuentas...")
+    deadline = time.time() + max(1.0, timeout_sec)
+    last_ready_count = -1
+
+    while True:
+        try:
+            ready_count = len(list(ready_dir.glob("*.ready")))
+        except OSError:
+            ready_count = 1
+
+        if ready_count != last_ready_count:
+            print(f"   Navegadores listos: {ready_count}/{expected_ready}")
+            last_ready_count = ready_count
+
+        if ready_count >= expected_ready:
+            print("   Todos los navegadores estan listos; iniciando trabajo en paralelo.")
+            return
+
+        if time.time() >= deadline:
+            print(
+                "   ADVERTENCIA: timeout esperando los otros navegadores; "
+                f"continuando con {ready_count}/{expected_ready} listos."
+            )
+            return
+
+        time.sleep(0.5)
+
+
+def _clipboard_lock_file_path() -> Path:
+    configured_path = os.getenv("FB_CLIPBOARD_LOCK_PATH", "").strip()
+    if configured_path:
+        return Path(configured_path)
+    return Path(__file__).resolve().with_name(".clipboard.lock")
+
+
+def _acquire_process_clipboard_lock(timeout_sec: float = 30.0):
+    """Adquiere un lock de portapapeles compartido entre procesos (Windows)."""
+    if msvcrt is None:
+        return None
+
+    lock_path = _clipboard_lock_file_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lock_handle = open(lock_path, "a+b")
+    lock_handle.seek(0, os.SEEK_END)
+    if lock_handle.tell() == 0:
+        lock_handle.write(b"0")
+        lock_handle.flush()
+
+    lock_handle.seek(0)
+    deadline = time.time() + timeout_sec
+    while True:
+        try:
+            msvcrt.locking(lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return lock_handle
+        except OSError:
+            if time.time() >= deadline:
+                lock_handle.close()
+                raise TimeoutError("Timeout esperando lock de portapapeles entre procesos.")
+            time.sleep(0.1)
+            lock_handle.seek(0)
+
+
+def _release_process_clipboard_lock(lock_handle) -> None:
+    if lock_handle is None or msvcrt is None:
+        return
+
+    try:
+        lock_handle.seek(0)
+        msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+    except Exception:
+        pass
+    finally:
+        try:
+            lock_handle.close()
+        except Exception:
+            pass
+
+
 def create_driver(headless: bool = False, profile_path: str = None) -> webdriver.Edge:
     """Crea instancia del navegador Microsoft Edge con anti-detección mejorada."""
     print("🌐 Inicializando navegador Edge con anti-detección...")
@@ -793,6 +938,109 @@ def keep_session_alive_during_pause(driver: webdriver.Edge, total_minutes: int) 
         return False
 
 
+UPLOAD_PREVIEW_XPATH = (
+    "//div[@role='dialog']//img["
+    "contains(@src, 'scontent') or contains(@src, 'blob:') or starts-with(@src, 'data:image/')"
+    "]"
+)
+
+UPLOAD_ERROR_PATTERNS = (
+    "no se pueden subir",
+    "no se puede subir",
+    "no se pudieron subir",
+    "no se pudo subir",
+    "no se pueden cargar",
+    "no se puede cargar",
+    "no se pudieron cargar",
+    "no se pudo cargar",
+    "couldn't upload",
+    "could not upload",
+    "unable to upload",
+)
+
+
+def _count_upload_previews(driver: webdriver.Edge) -> int:
+    try:
+        return len(driver.find_elements(By.XPATH, UPLOAD_PREVIEW_XPATH))
+    except Exception:
+        return 0
+
+
+def _get_visible_upload_error(driver: webdriver.Edge) -> str:
+    try:
+        body_text = driver.execute_script("return document.body ? document.body.innerText : '';") or ""
+    except Exception:
+        return ""
+
+    lowered_text = body_text.lower()
+    matched_pattern = next((pattern for pattern in UPLOAD_ERROR_PATTERNS if pattern in lowered_text), None)
+    if not matched_pattern:
+        return ""
+
+    for line in body_text.splitlines():
+        clean_line = line.strip()
+        if clean_line and matched_pattern in clean_line.lower():
+            return clean_line[:400]
+
+    return matched_pattern
+
+
+def _prepare_facebook_safe_image_copy(image_path: str) -> str:
+    path = Path(image_path)
+    if path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}:
+        return image_path
+
+    try:
+        from PIL import Image, ImageOps
+    except Exception:
+        return image_path
+
+    try:
+        stat = path.stat()
+        safe_dir = Path(tempfile.gettempdir()) / "facebook-upload-automatization" / "upload_images"
+        safe_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = f"{path.stem}_{int(stat.st_mtime)}_{stat.st_size}.jpg"
+        safe_path = safe_dir / safe_name
+        if safe_path.exists():
+            return str(safe_path)
+
+        with Image.open(path) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.mode in {"RGBA", "LA"} or "transparency" in img.info:
+                background = Image.new("RGB", img.size, (255, 255, 255))
+                alpha = img.getchannel("A") if "A" in img.getbands() else None
+                background.paste(img.convert("RGBA"), mask=alpha)
+                img = background
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+
+            max_side = 2048
+            if max(img.size) > max_side:
+                img.thumbnail((max_side, max_side), Image.LANCZOS)
+
+            img.save(safe_path, format="JPEG", quality=92, optimize=True, progressive=False)
+
+        return str(safe_path)
+    except Exception as exc:
+        print(f"   ADVERTENCIA: no se pudo preparar copia compatible de {path.name}: {exc}")
+        return image_path
+
+
+def _wait_for_new_upload_preview(driver: webdriver.Edge, previous_preview_count: int, timeout_sec: int = 25):
+    def upload_result(active_driver):
+        upload_error = _get_visible_upload_error(active_driver)
+        if upload_error:
+            return ("error", upload_error)
+
+        current_preview_count = _count_upload_previews(active_driver)
+        if current_preview_count > previous_preview_count:
+            return ("ok", current_preview_count)
+
+        return False
+
+    return WebDriverWait(driver, timeout_sec, poll_frequency=0.5).until(upload_result)
+
+
 def post_to_group(
     driver: webdriver.Edge,
     group_id: str,
@@ -814,16 +1062,32 @@ def post_to_group(
         return False
 
     print("⏳ Esperando a que cargue la página...")
-    wait_for_page_load(driver)
-    HumanBehavior.random_delay(3, 5)
+    try:
+        wait_for_page_load(driver)
+        HumanBehavior.random_delay(3, 5)
+    except Exception as e:
+        print(f"✗ Error esperando carga en grupo {group_id}: {e}")
+        if is_session_lost_error(e):
+            print("   ⚠️ Sesión/ventana perdida al cargar el grupo")
+        if debug_on_failure:
+            capture_failure_artifacts(driver, group_id, "page_load_failed", account_name)
+        return False
 
     # ═══ SIMULACIÓN DE EXPLORACIÓN HUMANA ═══
-    print("👀 Simulando exploración del grupo...")
-    HumanBehavior.human_scroll(driver, random.randint(200, 400))
-    HumanBehavior.random_delay(1, 2)
-    HumanBehavior.random_mouse_movements(driver, 3)
-    HumanBehavior.human_scroll(driver, random.randint(-150, -50))
-    HumanBehavior.random_delay(1, 2)
+    try:
+        print("👀 Simulando exploración del grupo...")
+        HumanBehavior.human_scroll(driver, random.randint(200, 400))
+        HumanBehavior.random_delay(1, 2)
+        HumanBehavior.random_mouse_movements(driver, 3)
+        HumanBehavior.human_scroll(driver, random.randint(-150, -50))
+        HumanBehavior.random_delay(1, 2)
+    except Exception as e:
+        print(f"✗ Error en exploración inicial del grupo {group_id}: {e}")
+        if is_session_lost_error(e):
+            print("   ⚠️ Sesión/ventana perdida durante exploración")
+        if debug_on_failure:
+            capture_failure_artifacts(driver, group_id, "exploration_failed", account_name)
+        return False
     
 
     
@@ -1000,114 +1264,162 @@ def post_to_group(
             HumanBehavior.random_delay(1, 2)
         
         # ═══ MÉTODO HÍBRIDO: PORTAPAPELES + FALLBACK A TIPEO HUMANO ═══
-        try:
-            print("   📋 Intentando método de portapapeles...")
-            with _clipboard_lock:
-                pyperclip.copy(message)
-                HumanBehavior.random_delay(0.5, 1)
+        disable_clipboard = _is_truthy_env("FB_DISABLE_CLIPBOARD")
 
-                action = ActionChains(driver)
-                action.key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
-
-                HumanBehavior.random_delay(1.2, 2)
-
-            # Verificar que se pegó correctamente
-            text_content = driver.execute_script("return arguments[0].textContent || arguments[0].innerText;", editor)
-            
-            if len(text_content) < len(message) * 0.8:
-                print("   ⚠️ Texto incompleto, reintentando via DOM...")
-                success = HumanBehavior.inject_text_via_dom(driver, editor, message)
-                if not success:
-                    print("      ⚠️ DOM falló, intentando escritura manual...")
-                    try:
-                        HumanBehavior.human_type(editor, message, wpm=random.randint(45, 65))
-                    except Exception as fallback_err:
-                        print(f"      ⚠️ Escritura manual también falló: {fallback_err}")
-                        ascii_message = message.encode('ascii', 'ignore').decode('ascii') or "[Mensaje con caracteres especiales]"
-                        try:
-                            editor.clear()
-                            editor.send_keys(ascii_message)
-                        except Exception:
-                            pass
-            else:
-                print(f"   ✓ Texto pegado ({len(text_content)} caracteres)")
-            
-        except Exception as e:
-            print(f"   ⚠️ Error portapapeles: {e}")
-            print("   ⌨️  Escribiendo via DOM (caracteres especiales)...")
-            # Usar inyección DOM para caracteres especiales (emojis, acentos, etc)
-            # que msedgedriver no puede manejar con send_keys()
+        if disable_clipboard:
+            print("   🛡️ Portapapeles desactivado: usando inyección DOM")
             success = HumanBehavior.inject_text_via_dom(driver, editor, message)
-            if not success:
-                # Fallback final: intentar human_type (puede fallar con emojis)
+            text_content = driver.execute_script("return arguments[0].textContent || arguments[0].innerText;", editor)
+            if success and len(text_content) >= len(message) * 0.8:
+                print(f"   ✓ Texto inyectado ({len(text_content)} caracteres)")
+            else:
+                print("   ⚠️ Inyección DOM incompleta, intentando escritura manual...")
                 try:
                     HumanBehavior.human_type(editor, message, wpm=random.randint(45, 65))
                 except Exception as fallback_err:
                     print(f"      ⚠️ Escritura manual también falló: {fallback_err}")
-                    # Última opción: escribir apenas con ASCII
                     ascii_message = message.encode('ascii', 'ignore').decode('ascii') or "[Mensaje con caracteres especiales]"
                     try:
                         editor.clear()
                         editor.send_keys(ascii_message)
-                    except:
+                    except Exception:
                         pass
+        else:
+            process_lock_handle = None
+            try:
+                process_lock_handle = _acquire_process_clipboard_lock(timeout_sec=45)
+                print("   📋 Intentando método de portapapeles...")
+                with _clipboard_lock:
+                    pyperclip.copy(message)
+                    HumanBehavior.random_delay(0.5, 1)
+
+                    action = ActionChains(driver)
+                    action.key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
+
+                    HumanBehavior.random_delay(1.2, 2)
+
+                # Verificar que se pegó correctamente
+                text_content = driver.execute_script("return arguments[0].textContent || arguments[0].innerText;", editor)
+                
+                if len(text_content) < len(message) * 0.8:
+                    print("   ⚠️ Texto incompleto, reintentando via DOM...")
+                    success = HumanBehavior.inject_text_via_dom(driver, editor, message)
+                    if not success:
+                        print("      ⚠️ DOM falló, intentando escritura manual...")
+                        try:
+                            HumanBehavior.human_type(editor, message, wpm=random.randint(45, 65))
+                        except Exception as fallback_err:
+                            print(f"      ⚠️ Escritura manual también falló: {fallback_err}")
+                            ascii_message = message.encode('ascii', 'ignore').decode('ascii') or "[Mensaje con caracteres especiales]"
+                            try:
+                                editor.clear()
+                                editor.send_keys(ascii_message)
+                            except Exception:
+                                pass
+                else:
+                    print(f"   ✓ Texto pegado ({len(text_content)} caracteres)")
+                
+            except Exception as e:
+                print(f"   ⚠️ Error portapapeles: {e}")
+                print("   ⌨️  Escribiendo via DOM (caracteres especiales)...")
+                # Usar inyección DOM para caracteres especiales (emojis, acentos, etc)
+                # que msedgedriver no puede manejar con send_keys()
+                success = HumanBehavior.inject_text_via_dom(driver, editor, message)
+                if not success:
+                    # Fallback final: intentar human_type (puede fallar con emojis)
+                    try:
+                        HumanBehavior.human_type(editor, message, wpm=random.randint(45, 65))
+                    except Exception as fallback_err:
+                        print(f"      ⚠️ Escritura manual también falló: {fallback_err}")
+                        # Última opción: escribir apenas con ASCII
+                        ascii_message = message.encode('ascii', 'ignore').decode('ascii') or "[Mensaje con caracteres especiales]"
+                        try:
+                            editor.clear()
+                            editor.send_keys(ascii_message)
+                        except:
+                            pass
+            finally:
+                _release_process_clipboard_lock(process_lock_handle)
         
         HumanBehavior.random_delay(1.2, 2)
-        
-        # ═══ SUBIR IMÁGENES CON VERIFICACIÓN DE PREVIEW ═══
+        uploaded_images = 0
         if images:
             print(f"📷 Subiendo {len(images)} imagen(es)...")
             for idx, img_path in enumerate(images, 1):
-                if os.path.exists(img_path):
-                    try:
-                        print(f"   🔍 Buscando input de archivo para imagen {idx}...")
-                        
-                        # Esperar a que el input file esté disponible
-                        file_input = None
-                        try:
-                            file_input = WebDriverWait(driver, 5).until(
-                                EC.presence_of_element_located((By.XPATH, "//div[@role='dialog']//input[@type='file']"))
-                            )
-                        except TimeoutException:
-                            try:
-                                file_input = driver.find_element(By.XPATH, "//input[@type='file']")
-                            except:
-                                pass
-                        
-                        if not file_input:
-                            print(f"   ✗ No se encontró input de archivo para imagen {idx}")
-                            continue
-                        
-                        # Convertir a ruta absoluta de Windows
-                        abs_path = os.path.abspath(img_path)
-                        print(f"   📤 Enviando imagen {idx}: {abs_path}")
-                        
-                        # Enviar la ruta al input
-                        file_input.send_keys(abs_path)
-                        
-                        print(f"   ⏳ Esperando procesamiento de imagen {idx}...")
-                        HumanBehavior.random_delay(5, 8)
-                        
-                        # Verificar que apareció el preview de la imagen
-                        try:
-                            WebDriverWait(driver, 8).until(
-                                EC.presence_of_element_located((By.XPATH, 
-                                    "//div[@role='dialog']//img[contains(@src, 'scontent') or contains(@src, 'blob:')]"
-                                ))
-                            )
-                            print(f"   ✓ Imagen {idx} cargada correctamente")
-                        except TimeoutException:
-                            print(f"   ⚠️ No se detectó preview de imagen {idx}")
-                            
-                    except Exception as e:
-                        print(f"   ✗ Error subiendo imagen {idx}: {e}")
-                        if is_session_lost_error(e):
-                            print("   ✗ Sesión/ventana del navegador perdida durante la subida de imágenes")
-                            return False
-                        traceback.print_exc()
-                else:
+                if not os.path.exists(img_path):
                     print(f"   ✗ Imagen no encontrada: {img_path}")
-        
+                    if debug_on_failure:
+                        capture_failure_artifacts(driver, group_id, "image_file_not_found", account_name)
+                    return False
+
+                try:
+                    print(f"   🔍 Buscando input de archivo para imagen {idx}...")
+
+                    file_input = None
+                    try:
+                        file_input = WebDriverWait(driver, 5).until(
+                            EC.presence_of_element_located((By.XPATH, "//div[@role='dialog']//input[@type='file']"))
+                        )
+                    except TimeoutException:
+                        try:
+                            file_input = driver.find_element(By.XPATH, "//input[@type='file']")
+                        except Exception:
+                            pass
+
+                    if not file_input:
+                        print(f"   ✗ No se encontró input de archivo para imagen {idx}")
+                        if debug_on_failure:
+                            capture_failure_artifacts(driver, group_id, "file_input_not_found", account_name)
+                        return False
+
+                    abs_path = os.path.abspath(img_path)
+                    upload_path = _prepare_facebook_safe_image_copy(abs_path)
+                    preview_count_before = _count_upload_previews(driver)
+                    print(f"   📤 Enviando imagen {idx}: {abs_path}")
+                    if upload_path != abs_path:
+                        print(f"      Usando copia compatible: {upload_path}")
+
+                    file_input.send_keys(upload_path)
+
+                    print(f"   ⏳ Esperando procesamiento de imagen {idx}...")
+                    try:
+                        upload_status, upload_detail = _wait_for_new_upload_preview(driver, preview_count_before)
+                    except TimeoutException:
+                        print(f"   ✗ No se detectó preview nuevo para imagen {idx}: {Path(img_path).name}")
+                        if debug_on_failure:
+                            capture_failure_artifacts(driver, group_id, "image_preview_not_detected", account_name)
+                        return False
+
+                    if upload_status == "error":
+                        print(f"   ✗ Facebook rechazó la imagen {idx}: {upload_detail}")
+                        if debug_on_failure:
+                            capture_failure_artifacts(driver, group_id, "image_upload_rejected", account_name)
+                        return False
+
+                    HumanBehavior.random_delay(2, 3)
+                    late_upload_error = _get_visible_upload_error(driver)
+                    if late_upload_error:
+                        print(f"   ✗ Facebook reportó error de subida: {late_upload_error}")
+                        if debug_on_failure:
+                            capture_failure_artifacts(driver, group_id, "image_upload_error_visible", account_name)
+                        return False
+
+                    uploaded_images += 1
+                    print(f"   ✓ Imagen {idx} cargada correctamente")
+                except Exception as e:
+                    print(f"   ✗ Error subiendo imagen {idx}: {e}")
+                    if is_session_lost_error(e):
+                        print("   ✗ Sesión/ventana del navegador perdida durante la subida de imágenes")
+                        return False
+                    traceback.print_exc()
+                    if debug_on_failure:
+                        capture_failure_artifacts(driver, group_id, "image_upload_exception", account_name)
+                    return False
+
+            if uploaded_images != len(images):
+                print(f"   ✗ Solo se cargaron {uploaded_images}/{len(images)} imágenes; no se publicará incompleto.")
+                return False
+
         HumanBehavior.random_delay(2, 3)
         
 
@@ -1205,6 +1517,13 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int, cli_deb
     groups = account_cfg.get("groups", [])
     debug_on_failure = bool(account_cfg.get("debug_on_failure", False) or cli_debug_on_failure)
     force_close_edge = bool(account_cfg.get("force_close_edge_before_start", True))
+    disable_edge_cleanup = os.getenv("FB_DISABLE_EDGE_CLEANUP", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    cleanup_edge_processes_enabled = force_close_edge and not disable_edge_cleanup
 
     if not groups:
         print("✗ No hay grupos configurados para esta cuenta")
@@ -1214,20 +1533,87 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int, cli_deb
         print("✗ Debes proporcionar email/password o edge_profile_path en la configuración")
         return (0, 0)
 
+    unique_group_ids: list[str] = []
+    seen_group_ids: set[str] = set()
+    for group in groups:
+        group_id = str(group.get("id", "")).strip()
+        if not group_id or group_id in seen_group_ids:
+            continue
+        seen_group_ids.add(group_id)
+        unique_group_ids.append(group_id)
+
+    raw_random_catalog_count = account_cfg.get("limited_catalog_random_groups_count")
+    if raw_random_catalog_count is None:
+        random_catalog_count = LIMITED_PRODUCTS_RANDOM_GROUPS_COUNT
+    else:
+        try:
+            random_catalog_count = max(0, int(raw_random_catalog_count))
+        except (TypeError, ValueError):
+            random_catalog_count = LIMITED_PRODUCTS_RANDOM_GROUPS_COUNT
+
+    if unique_group_ids and random_catalog_count > 0:
+        limited_catalog_sample_size = min(random_catalog_count, len(unique_group_ids))
+        limited_catalog_group_ids = set(random.sample(unique_group_ids, limited_catalog_sample_size))
+    else:
+        limited_catalog_group_ids = set()
+
+    def build_limited_catalog_message(message: str) -> str:
+        configured_message = account_cfg.get("limited_catalog_message")
+        if isinstance(configured_message, str) and configured_message.strip():
+            return configured_message
+        return LIMITED_PRODUCTS_PROMO_MESSAGE
+
+    def filter_images_for_limited_catalog(images: List[str]) -> List[str]:
+        if not images:
+            return images
+
+        filtered_images = [
+            image_path
+            for image_path in images
+            if any(keyword in Path(image_path).name.lower() for keyword in LIMITED_PRODUCTS_KEYWORDS)
+        ]
+        return filtered_images if filtered_images else images
+
+    def resolve_group_content(group: Dict[str, Any], group_id: str) -> tuple[str, List[str], bool]:
+        message = group.get("message") or default_message
+        images = group.get("images")
+        if images is None:
+            resolved_images = list(default_images)
+        else:
+            resolved_images = list(images)
+
+        use_limited_catalog = group_id in limited_catalog_group_ids
+        if use_limited_catalog:
+            message = build_limited_catalog_message(message)
+            resolved_images = filter_images_for_limited_catalog(resolved_images)
+
+        if randomize_images_order and resolved_images:
+            random.shuffle(resolved_images)
+
+        return message, resolved_images, use_limited_catalog
+
     print(f"\n{'═'*60}")
     print(f"  Iniciando [{account_name}] - {len(groups)} grupo(s)")
     print(f"{'═'*60}\n")
     if debug_on_failure:
         print("🧪 Debug de fallos activado (capturas + HTML + metadatos)")
+    if limited_catalog_group_ids:
+        print(
+            f"🎯 Se seleccionaron {len(limited_catalog_group_ids)} grupos aleatorios "
+            "para publicar solo creatina y shakers"
+        )
+    if force_close_edge and disable_edge_cleanup:
+        print("🛡️ Limpieza global de Edge desactivada por FB_DISABLE_EDGE_CLEANUP=1")
 
     driver = None
     try:
-        if profile_path and force_close_edge:
+        if profile_path and cleanup_edge_processes_enabled:
             print("🧹 Cerrando procesos Edge previos para liberar el perfil...")
             cleanup_edge_processes()
             HumanBehavior.random_delay(1, 2)
 
         driver = create_driver(headless=headless, profile_path=profile_path)
+        _wait_for_parallel_browsers_ready(account_name)
 
         # Login si no hay perfil con sesión
         if not profile_path:
@@ -1252,7 +1638,7 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int, cli_deb
                     driver = create_driver(headless=headless, profile_path=profile_path)
 
             if not opened:
-                if profile_path and force_close_edge:
+                if profile_path and cleanup_edge_processes_enabled:
                     print("   🧹 Reintentando con limpieza adicional de procesos Edge...")
                     cleanup_edge_processes()
                     HumanBehavior.random_delay(1, 2)
@@ -1297,7 +1683,7 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int, cli_deb
             HumanBehavior.random_delay(2, 4)
             driver = create_driver(headless=headless, profile_path=profile_path)
             if not navigate_with_retries(driver, "https://www.facebook.com/", retries=2):
-                if profile_path and force_close_edge:
+                if profile_path and cleanup_edge_processes_enabled:
                     print("   🧹 Limpieza de procesos y segundo intento de recuperación...")
                     cleanup_edge_processes()
                     HumanBehavior.random_delay(1, 2)
@@ -1338,8 +1724,27 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int, cli_deb
         print(f"{'─'*60}\n")
 
         # Verificar si se debe usar batch posting (para cuentas con restricción)
-        batch_size = account_cfg.get("batch_size")
-        batch_delay_minutes = account_cfg.get("batch_delay_minutes")
+        raw_batch_size = account_cfg.get("batch_size")
+        raw_batch_delay_minutes = account_cfg.get("batch_delay_minutes")
+
+        try:
+            batch_size = int(raw_batch_size) if raw_batch_size is not None else None
+        except (TypeError, ValueError):
+            batch_size = None
+
+        try:
+            batch_delay_minutes = (
+                int(raw_batch_delay_minutes)
+                if raw_batch_delay_minutes is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            batch_delay_minutes = None
+
+        if batch_size is not None and batch_size < 1:
+            batch_size = None
+        if batch_delay_minutes is not None and batch_delay_minutes < 1:
+            batch_delay_minutes = None
         
         if batch_size and batch_delay_minutes:
             # Modo batch posting
@@ -1358,7 +1763,7 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int, cli_deb
                 
                 # Procesar grupos en este bloque
                 for i, group in enumerate(batch, 1):
-                    group_id = group.get("id")
+                    group_id = str(group.get("id", "")).strip()
                     if not group_id:
                         continue
 
@@ -1371,15 +1776,10 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int, cli_deb
                     global_pos = (batch_num - 1) * batch_size + i
                     
                     print(f"[{global_pos}/{total_groups}] Procesando grupo: {group_id}")
-                    
-                    message = group.get("message") or default_message
-                    images = group.get("images")
-                    if images is None:
-                        images = list(default_images)
-                    else:
-                        images = list(images)
-                    if randomize_images_order and images:
-                        random.shuffle(images)
+
+                    message, images, use_limited_catalog = resolve_group_content(group, group_id)
+                    if use_limited_catalog:
+                        print("   🥤⚡ Modo catálogo reducido: solo creatina y shakers")
                     
                     if post_to_group(
                         driver,
@@ -1402,8 +1802,12 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int, cli_deb
                 
                 # Espera entre bloques (solo si no es el último bloque)
                 if batch_num < total_batches:
-                    # Delay aleatorio entre 5 y 10 minutos
-                    actual_delay_minutes = random.randint(5, 10)
+                    # Delay aleatorio en torno al valor configurado por cuenta.
+                    max_extra_delay = max(1, min(3, batch_delay_minutes // 2))
+                    actual_delay_minutes = random.randint(
+                        batch_delay_minutes,
+                        batch_delay_minutes + max_extra_delay,
+                    )
                     batch_wait_seconds = actual_delay_minutes * 60
                     print(f"\n⏳ PAUSA ENTRE BLOQUES: {actual_delay_minutes} minutos ({batch_wait_seconds}s)")
                     print(f"   Próximo bloque en {actual_delay_minutes} minutos...\n")
@@ -1422,7 +1826,7 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int, cli_deb
         else:
             # Modo normal (sin batch posting)
             for i, group in enumerate(groups, 1):
-                group_id = group.get("id")
+                group_id = str(group.get("id", "")).strip()
                 if not group_id:
                     continue                                                    
 
@@ -1433,14 +1837,9 @@ def run_account(account_cfg: Dict[str, Any], headless: bool, delay: int, cli_deb
 
                 print(f"[{i}/{total_groups}] Procesando grupo: {group_id}")
 
-                message = group.get("message") or default_message
-                images = group.get("images")
-                if images is None:
-                    images = list(default_images)
-                else:
-                    images = list(images)
-                if randomize_images_order and images:
-                    random.shuffle(images)
+                message, images, use_limited_catalog = resolve_group_content(group, group_id)
+                if use_limited_catalog:
+                    print("   🥤⚡ Modo catálogo reducido: solo creatina y shakers")
 
                 if post_to_group(
                     driver,
@@ -1489,10 +1888,18 @@ def main():
                        help="Segundos mínimos entre publicaciones (default: 15)")
     parser.add_argument("--debug-on-failure", action="store_true",
                        help="Guardar evidencia de fallos (screenshot, HTML y metadata) en debug_failures/")
+    parser.add_argument("--account-name", help="Nombre exacto de la cuenta activa a ejecutar")
+    parser.add_argument("--account-index", type=int,
+                       help="Índice (1-based) de la cuenta activa a ejecutar")
+    parser.add_argument("--all-active", action="store_true",
+                       help="Ejecutar todas las cuentas activas en secuencia")
     args = parser.parse_args()
 
+    if args.account_index is not None and args.account_index < 1:
+        parser.error("--account-index debe ser >= 1")
+
     print("\n" + "═"*60)
-    print("  FACEBOOK GROUP POSTER - Single Account v3.1")
+    print("  FACEBOOK GROUP POSTER - Multi Account v3.2")
     print("═"*60 + "\n")
 
     if not os.path.exists(args.config):
@@ -1500,12 +1907,15 @@ def main():
         sys.exit(1)
 
     try:
-        result = run_single_account_from_config(
+        result = run_accounts_from_config(
             config_path=args.config,
             headless=args.headless,
             delay=args.delay,
             cli_debug_on_failure=args.debug_on_failure,
             run_account_callable=run_account,
+            account_name=args.account_name,
+            account_index=args.account_index,
+            run_all_active=args.all_active,
         )
     except ValueError as config_error:
         print(f"✗ Configuración inválida: {config_error}")
@@ -1514,14 +1924,25 @@ def main():
     print(f"✓ Configuración cargada: {args.config}")
     print(f"✓ {result.configured_accounts} cuenta(s) configurada(s)")
     print(f"✓ {result.active_accounts} cuenta(s) activa(s)")
+    print(f"✓ {len(result.account_results)} cuenta(s) seleccionada(s) para ejecución")
 
-    if result.multiple_accounts_detected:
-        print("⚠️ Se detectaron múltiples cuentas activas; en este modo se usará solo la primera.")
+    if result.multiple_accounts_detected and len(result.account_results) == 1 and not (
+        args.account_name or args.account_index or args.all_active
+    ):
+        print("⚠️ Se detectaron múltiples cuentas activas; en modo por defecto se usa solo la primera.")
 
     print(f"\n{'═'*60}")
     print("  RESUMEN GLOBAL")
     print(f"{'═'*60}")
-    print(f"  [{result.selected_account_name}]: {result.success_count}/{result.total_groups} publicaciones exitosas")
+    for account_result in result.account_results:
+        print(
+            f"  [{account_result.account_name}]: "
+            f"{account_result.success_count}/{account_result.total_groups} publicaciones exitosas"
+        )
+
+    total_success = sum(item.success_count for item in result.account_results)
+    total_groups = sum(item.total_groups for item in result.account_results)
+    print(f"  TOTAL: {total_success}/{total_groups} publicaciones exitosas")
     print(f"{'═'*60}\n")
 
 

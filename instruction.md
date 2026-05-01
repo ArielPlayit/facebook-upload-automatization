@@ -12,12 +12,10 @@ When the normal publication run fails in one or more groups, always do an automa
 ## Canonical Files
 
 - Normal run log: task_log.txt
-- Failed retry config (canonical in this repo): config.failed-groups.test.json
 - Failed retry runner: run_failed_groups_test.ps1
 - Failed retry log: task_log_failed_groups_test.txt
 
 Note:
-- "config.failed-groups" means the canonical file config.failed-groups.test.json in this repo.
 - "run_failed_groups" means the canonical script run_failed_groups_test.ps1 in this repo.
 
 ## Required Behavior In Every Iteration
@@ -36,7 +34,7 @@ powershell -ExecutionPolicy Bypass -File .\run_failed_groups_test.ps1
 
 Reason:
 - The script already auto-detects latest failed IDs from task_log.txt when GroupIds is not provided.
-- The script already overwrites config.failed-groups.test.json with selected failed groups.
+- The script generates its temporary failed-groups config outside the project folder.
 - The script already runs post_to_groups_selenium.py with that temporary failed config.
 
 ## Optional Manual Command (Only if auto-detection fails)

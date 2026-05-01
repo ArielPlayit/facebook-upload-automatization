@@ -114,6 +114,29 @@ python setup_session.py
 
 Esto abrirá Edge para que inicies sesión manualmente. La sesión se guardará en `edge_profile/`.
 
+Para una segunda cuenta en un navegador/perfil separado:
+
+```powershell
+python setup_session.py --profile edge_profile2
+```
+
+Luego apunta la segunda cuenta a esa carpeta en `config.json`:
+
+```json
+{
+  "accounts": [
+    {
+      "name": "Cuenta 1",
+      "edge_profile_path": "C:/.../edge_profile"
+    },
+    {
+      "name": "Cuenta 2",
+      "edge_profile_path": "C:/.../edge_profile2"
+    }
+  ]
+}
+```
+
 ---
 
 ## Uso
@@ -122,6 +145,26 @@ Esto abrirá Edge para que inicies sesión manualmente. La sesión se guardará 
 
 ```powershell
 python post_to_groups_selenium.py --config config.json
+```
+
+Comportamiento por defecto: si hay varias cuentas activas, se usa la primera.
+
+### Ejecutar una cuenta específica por nombre:
+
+```powershell
+python post_to_groups_selenium.py --config config.json --account-name "Cuenta 2"
+```
+
+### Ejecutar una cuenta específica por índice de cuenta activa (1-based):
+
+```powershell
+python post_to_groups_selenium.py --config config.json --account-index 2
+```
+
+### Ejecutar todas las cuentas activas en secuencia:
+
+```powershell
+python post_to_groups_selenium.py --config config.json --all-active
 ```
 
 ### Con delay personalizado entre grupos (segundos):

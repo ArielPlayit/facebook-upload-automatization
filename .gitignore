@@ -25,3 +25,14 @@ tmpclaude-*
 
 #Debug Folder
 debug_failures/
+
+# Archivos de configuracion adicionales
+config*.json
+!config.example.json
+*.bak
+
+# Logs adicionales
+task_log*.txt
+
+# Lock inter-proceso
+.clipboard.lock
